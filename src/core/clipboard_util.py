@@ -546,6 +546,7 @@ if (-not [string]::IsNullOrWhiteSpace($result)) {
 """
     try:
         encoded = base64.b64encode(script.encode("utf-16le")).decode("ascii")
+        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
         proc = subprocess.run(
             [
                 "powershell",
@@ -560,6 +561,7 @@ if (-not [string]::IsNullOrWhiteSpace($result)) {
             encoding="utf-8",
             errors="replace",
             timeout=2.5,
+            creationflags=creationflags,
         )
         if proc.returncode != 0:
             stderr = (proc.stderr or "").strip()
