@@ -13,12 +13,13 @@ class HotkeyWorker(QThread):
     finished       = pyqtSignal(str)   # final result (full text)
     error          = pyqtSignal(str)
 
-    def __init__(self, audio_bytes: bytes, selected_text: str, processor, config):
+    def __init__(self, audio_bytes: bytes, selected_text: str, processor, config, db=None):
         super().__init__()
         self.audio_bytes   = audio_bytes
         self.selected_text = selected_text
         self.processor     = processor
         self.config        = config
+        self.db            = db
 
     def run(self):
         try:
@@ -26,7 +27,7 @@ class HotkeyWorker(QThread):
             self.status_update.emit("正在转写语音…")
             from src.core.asr_client import ASRClient
 
-            text = ASRClient(self.config).transcribe(self.audio_bytes)
+            text = ASRClient(self.config, self.db).transcribe(self.audio_bytes)
             if not text or not text.strip():
                 raise ValueError("语音转写失败，请检查 ASR 配置或网络")
 

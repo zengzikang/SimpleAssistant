@@ -5,11 +5,11 @@ TrayIcon — 程序常驻的系统托盘图标，同时也是整个语音处理�
 而不是等到主界面打开时才初始化。
 """
 
-import threading
+import time
 
 from PyQt5.QtWidgets import QSystemTrayIcon, QMenu, QAction
 from PyQt5.QtGui import QIcon, QPixmap, QPainter, QColor, QFont
-from PyQt5.QtCore import Qt, pyqtSlot
+from PyQt5.QtCore import Qt, QTimer, pyqtSlot
 
 from src.core.context_manager import ContextManager
 from src.core.processor import Processor
@@ -55,6 +55,7 @@ class TrayIcon(QSystemTrayIcon):
         # Runtime state
         self._main_window  = None
         self._overlay      = None
+        self._overlay_token = 0
         self._recording    = False
         self._recorder     = None
         self._worker       = None
@@ -147,7 +148,15 @@ class TrayIcon(QSystemTrayIcon):
             print(f"[TrayIcon] 录音启动失败: {exc}")
             return
 
-        overlay.show_recording()
+        # Delay the overlay until clipboard capture finishes (or times out).
+        # Chromium/Electron editors rely on synthetic Ctrl+C; if our floating
+        # window appears too early, they can lose focus and the capture path
+        # fails, which is why selection currently only works in Notepad++.
+        self._overlay_token += 1
+        self._show_recording_overlay_when_ready(
+            self._overlay_token,
+            deadline=time.monotonic() + 1.2,
+        )
         print("[TrayIcon] 录音已开始")
 
     @pyqtSlot()
@@ -183,9 +192,24 @@ class TrayIcon(QSystemTrayIcon):
         overlay.show_processing("正在转写语音")
         self._run_pipeline(audio_bytes, selected_text)
 
+    def _show_recording_overlay_when_ready(self, token: int, deadline: float):
+        if token != self._overlay_token or not self._recording:
+            return
+        if self._hotkey.wait_for_capture(0):
+            self._get_overlay().show_recording()
+            return
+        if time.monotonic() >= deadline:
+            print("[TrayIcon] 选中文本捕获超时，继续显示录音浮层")
+            self._get_overlay().show_recording()
+            return
+        QTimer.singleShot(
+            40,
+            lambda: self._show_recording_overlay_when_ready(token, deadline),
+        )
+
     def _run_pipeline(self, audio_bytes: bytes, selected_text: str):
         from src.core.hotkey_worker import HotkeyWorker
-        worker = HotkeyWorker(audio_bytes, selected_text, self.processor, self.config)
+        worker = HotkeyWorker(audio_bytes, selected_text, self.processor, self.config, self.db)
         worker.status_update.connect(self._on_status)
         worker.asr_done.connect(self._on_asr_done)
         worker.finished.connect(self._on_pipeline_done)

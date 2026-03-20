@@ -2,9 +2,10 @@
 Windows-native global keyboard hook via ctypes (WH_KEYBOARD_LL).
 
 Interaction model: TOGGLE
-  First  keydown → on_press()   (start recording)
-  Second keydown → on_release() (stop  recording)
-Key-up events are ignored.
+  First  keyup → on_press()   (start recording)
+  Second keyup → on_release() (stop  recording)
+Physical keydown is suppressed to avoid menu activation; the actual toggle
+fires on keyup so modifier keys are fully released before we inject Ctrl+C.
 
 64-bit notes
 ------------
@@ -125,7 +126,7 @@ class Win32KeyHook:
                         pass
                     else:
                         # Physical key — handle toggle and suppress.
-                        if wParam in (WM_KEYDOWN, WM_SYSKEYDOWN):
+                        if wParam in (WM_KEYUP, WM_SYSKEYUP):
                             if not recording:
                                 recording = True
                                 try:

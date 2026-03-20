@@ -2,6 +2,7 @@ from typing import Optional, List, Dict, Callable
 
 from .llm_client import LLMClient
 from .context_manager import ContextManager
+from src.config.manager import DEFAULT_PROMPT_TEMPLATES
 
 # ── Prompt templates ──────────────────────────────────────────────────────────
 
@@ -42,14 +43,6 @@ CLEAN_PROMPT = """请处理以下语音转写文字：
 
 {text}"""
 
-TRANSLATE_PROMPT = "请将以下文字翻译为{target_lang}，保持原文语气。只输出翻译结果：\n\n{text}"
-
-POLISH_PROMPT = "请润色以下文字，使其更流畅专业。只输出润色后的文字：\n\n{text}"
-
-CONTINUE_PROMPT = "请续写以下文字，保持相同风格和主题。只输出续写内容（不重复原文）：\n\n{text}"
-
-CORRECT_PROMPT = "请纠正以下文字中的所有错误（错别字、语法、标点）。只输出纠正后的文字：\n\n{text}"
-
 CUSTOM_PROMPT = "请按以下指令处理文字。\n指令：{instruction}\n\n文字：\n{text}"
 
 
@@ -61,16 +54,7 @@ class Processor:
         self.llm = LLMClient(config)
 
     def _system_message(self) -> str:
-        template = self.config.get("system_prompt") or ""
-        hot_words = self.db.get_hot_words()
-        hot_words_str = "、".join(hot_words) if hot_words else "（暂无）"
-        try:
-            return template.format(
-                hot_words=hot_words_str,
-                user_habits="（根据使用历史自动学习）",
-            )
-        except KeyError:
-            return template
+        return self.config.get("system_prompt") or ""
 
     def _messages(self, user_prompt: str, include_context: bool = True) -> List[Dict]:
         msgs: List[Dict] = []
@@ -81,6 +65,21 @@ class Processor:
             msgs.extend(self.context.get_messages())
         msgs.append({"role": "user", "content": user_prompt})
         return msgs
+
+    def _prompt_template(self, key: str) -> str:
+        return self.config.get("prompt_templates", key) or DEFAULT_PROMPT_TEMPLATES[key]
+
+    def _process_selected_text(
+        self,
+        voice_text: str,
+        selected_text: str,
+        stream_callback: Optional[Callable] = None,
+    ) -> str:
+        prompt = self._prompt_template("selected_text_operation").format(
+            voice_text=voice_text,
+            selected_text=selected_text,
+        )
+        return self.llm.chat(self._messages(prompt, True), stream_callback)
 
     # ── Main hotkey pipeline entry point ─────────────────────────────────────
 
@@ -95,20 +94,22 @@ class Processor:
         (if any) or to the voice text itself.
         """
         if selected_text.strip():
-            selected_section = f"【选中文字（用户当前选中的内容）】\n{selected_text}"
+            result = self._process_selected_text(
+                voice_text=voice_text,
+                selected_text=selected_text,
+                stream_callback=stream_callback,
+            )
         else:
             selected_section = "【选中文字】\n（无，请直接整理语音内容）"
-
-        hot_words = self.db.get_hot_words()
-        hot_words_str = "、".join(hot_words) if hot_words else "（暂无）"
-
-        prompt = SMART_DISPATCH_PROMPT.format(
-            voice_text=voice_text,
-            selected_section=selected_section,
-            hot_words=hot_words_str,
-        )
-        msgs = self._messages(prompt, include_context=True)
-        result = self.llm.chat(msgs, stream_callback)
+            hot_words = self.db.get_hot_words()
+            hot_words_str = "、".join(hot_words) if hot_words else "（暂无）"
+            prompt = SMART_DISPATCH_PROMPT.format(
+                voice_text=voice_text,
+                selected_section=selected_section,
+                hot_words=hot_words_str,
+            )
+            msgs = self._messages(prompt, include_context=True)
+            result = self.llm.chat(msgs, stream_callback)
 
         # Store in context and history
         context_label = f"[语音指令] {voice_text}"
@@ -134,24 +135,42 @@ class Processor:
     def translate(self, text: str, target_lang: str = "英语",
                   stream_callback: Optional[Callable] = None) -> str:
         result = self.llm.chat(
-            self._messages(TRANSLATE_PROMPT.format(text=text, target_lang=target_lang), False),
+            self._messages(
+                f"请将以下文字翻译为{target_lang}，保持原文语气。只输出翻译结果：\n\n{text}",
+                False,
+            ),
             stream_callback,
         )
         self.db.add_history(f"translate_{target_lang}", text, result)
         return result
 
     def polish(self, text: str, stream_callback: Optional[Callable] = None) -> str:
-        result = self.llm.chat(self._messages(POLISH_PROMPT.format(text=text), False), stream_callback)
+        result = self.llm.chat(
+            self._messages(f"请润色以下文字，使其更流畅专业。只输出润色后的文字：\n\n{text}", False),
+            stream_callback,
+        )
         self.db.add_history("polish", text, result)
         return result
 
     def continue_text(self, text: str, stream_callback: Optional[Callable] = None) -> str:
-        result = self.llm.chat(self._messages(CONTINUE_PROMPT.format(text=text), False), stream_callback)
+        result = self.llm.chat(
+            self._messages(
+                f"请续写以下文字，保持相同风格和主题。只输出续写内容（不重复原文）：\n\n{text}",
+                False,
+            ),
+            stream_callback,
+        )
         self.db.add_history("continue", text, result)
         return result
 
     def correct(self, text: str, stream_callback: Optional[Callable] = None) -> str:
-        result = self.llm.chat(self._messages(CORRECT_PROMPT.format(text=text), False), stream_callback)
+        result = self.llm.chat(
+            self._messages(
+                f"请纠正以下文字中的所有错误（错别字、语法、标点）。只输出纠正后的文字：\n\n{text}",
+                False,
+            ),
+            stream_callback,
+        )
         self.db.add_history("correct", text, result)
         return result
 

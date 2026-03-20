@@ -15,6 +15,7 @@ from PyQt5.QtWidgets import (
     QDoubleSpinBox,
     QDialogButtonBox,
     QCheckBox,
+    QScrollArea,
 )
 from PyQt5.QtGui import QFont
 from PyQt5.QtCore import Qt
@@ -38,6 +39,7 @@ class SettingsDialog(QDialog):
         self.tabs.addTab(self._build_llm_tab(), "大语言模型")
         self.tabs.addTab(self._build_asr_tab(), "语音识别(ASR)")
         self.tabs.addTab(self._build_prompt_tab(), "系统提示词")
+        self.tabs.addTab(self._build_operation_prompts_tab(), "处理提示词")
         self.tabs.addTab(self._build_hotwords_tab(), "热词管理")
         self.tabs.addTab(self._build_context_tab(), "上下文")
         layout.addWidget(self.tabs)
@@ -183,7 +185,7 @@ class SettingsDialog(QDialog):
         layout.setSpacing(6)
 
         layout.addWidget(
-            QLabel("系统提示词（支持占位符：{hot_words}、{user_habits}）：")
+            QLabel("系统提示词：")
         )
 
         self.system_prompt_edit = QTextEdit()
@@ -195,6 +197,32 @@ class SettingsDialog(QDialog):
         layout.addWidget(reset_btn)
 
         return w
+
+    def _build_operation_prompts_tab(self) -> QWidget:
+        container = QWidget()
+        outer = QVBoxLayout(container)
+        outer.setContentsMargins(0, 0, 0, 0)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        outer.addWidget(scroll)
+
+        w = QWidget()
+        layout = QVBoxLayout(w)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(8)
+
+        self.selected_operation_prompt_edit = self._add_prompt_editor(
+            layout, "选中内容处理提示词（支持 {voice_text}、{selected_text}）："
+        )
+
+        reset_btn = QPushButton("恢复默认处理提示词")
+        reset_btn.clicked.connect(self._reset_operation_prompts)
+        layout.addWidget(reset_btn)
+        layout.addStretch(1)
+
+        scroll.setWidget(w)
+        return container
 
     # ── Hot words tab ─────────────────────────────────────────────────────────
 
@@ -284,6 +312,9 @@ class SettingsDialog(QDialog):
 
         # Prompt
         self.system_prompt_edit.setPlainText(c.get("system_prompt") or "")
+        self.selected_operation_prompt_edit.setPlainText(
+            c.get("prompt_templates", "selected_text_operation") or ""
+        )
 
         # Hot words
         self.hotword_list.clear()
@@ -319,6 +350,9 @@ class SettingsDialog(QDialog):
                     "language": self.asr_language.text() or "zh",
                 },
                 "system_prompt": self.system_prompt_edit.toPlainText(),
+                "prompt_templates": {
+                    "selected_text_operation": self.selected_operation_prompt_edit.toPlainText(),
+                },
                 "context": {
                     "max_rounds": self.ctx_max_rounds.value(),
                     "max_hours": self.ctx_max_hours.value(),
@@ -348,9 +382,24 @@ class SettingsDialog(QDialog):
         idx = combo.findText(value)
         combo.setCurrentIndex(max(0, idx))
 
+    def _add_prompt_editor(self, layout: QVBoxLayout, label_text: str) -> QTextEdit:
+        layout.addWidget(QLabel(label_text))
+        edit = QTextEdit()
+        edit.setFont(QFont("Courier New", 11))
+        edit.setMinimumHeight(96)
+        layout.addWidget(edit)
+        return edit
+
     def _reset_prompt(self):
         from src.config.manager import DEFAULT_SYSTEM_PROMPT
         self.system_prompt_edit.setPlainText(DEFAULT_SYSTEM_PROMPT)
+
+    def _reset_operation_prompts(self):
+        from src.config.manager import DEFAULT_PROMPT_TEMPLATES
+
+        self.selected_operation_prompt_edit.setPlainText(
+            DEFAULT_PROMPT_TEMPLATES["selected_text_operation"]
+        )
 
     def _add_hotword(self):
         word = self.new_hotword_input.text().strip()

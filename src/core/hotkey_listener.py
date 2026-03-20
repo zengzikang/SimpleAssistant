@@ -31,6 +31,8 @@ class HotkeyListener(QObject):
         self._listener     = None   # pynput Listener instance (non-Windows)
         self._recording    = False  # toggle state
         self.captured_text = ""
+        self._capture_done = threading.Event()
+        self._capture_done.set()
 
     # ── Public ────────────────────────────────────────────────────────────────
 
@@ -59,6 +61,8 @@ class HotkeyListener(QObject):
             def on_press():
                 # Called from hook thread — must return fast
                 print(f"[HotkeyListener] START recording")
+                self.captured_text = ""
+                self._capture_done.clear()
                 threading.Thread(
                     target=self._capture_clipboard, daemon=True
                 ).start()
@@ -113,6 +117,8 @@ class HotkeyListener(QObject):
                     if not self._recording:
                         self._recording = True
                         print(f"[HotkeyListener/pynput] START {key!r}")
+                        self.captured_text = ""
+                        self._capture_done.clear()
                         threading.Thread(
                             target=self._capture_clipboard, daemon=True
                         ).start()
@@ -137,11 +143,23 @@ class HotkeyListener(QObject):
 
     # ── Clipboard capture (separate daemon thread) ────────────────────────────
 
+    def wait_for_capture(self, timeout: float = 0.0) -> bool:
+        return self._capture_done.wait(timeout)
+
     def _capture_clipboard(self):
         try:
             from src.core.clipboard_util import capture_selected_text
+            # The standalone test works because copy is triggered after the
+            # target app has fully settled. In the main flow we start capture
+            # immediately after the global hotkey toggles, which is too early
+            # for some Qt/Chromium apps. Give focus/selection a brief moment
+            # to stabilize before simulating copy.
+            import time
+            time.sleep(0.18)
             self.captured_text = capture_selected_text()
             print(f"[HotkeyListener] 剪贴板: {repr(self.captured_text[:60])}")
         except Exception as exc:
             print(f"[HotkeyListener] 剪贴板捕获失败: {exc}")
             self.captured_text = ""
+        finally:
+            self._capture_done.set()

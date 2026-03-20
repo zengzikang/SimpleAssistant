@@ -5,8 +5,9 @@ from typing import Optional
 class ASRClient:
     """Sends audio bytes to the configured ASR endpoint and returns transcribed text."""
 
-    def __init__(self, config):
+    def __init__(self, config, db=None):
         self.config = config
+        self.db = db
 
     def transcribe(self, audio_bytes: bytes) -> Optional[str]:
         provider = self.config.get("asr", "provider") or "custom"
@@ -30,11 +31,16 @@ class ASRClient:
             audio_file.name = "audio.wav"
             language = self.config.get("asr", "language") or "zh"
             model = self.config.get("asr", "model") or "whisper-1"
-
+            hot_words = "|".join(self.db.get_hot_words()) if self.db else ""
+            print(f"hotwords: {hot_words}")
+            extra: dict = {}
+            if hot_words:
+                extra["hotwords"] = hot_words
             response = client.audio.transcriptions.create(
                 model=model,
                 file=audio_file,
                 language=language,
+                extra_body=extra,
             )
             return response.text
         except Exception as e:

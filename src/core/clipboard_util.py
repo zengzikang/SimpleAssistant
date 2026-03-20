@@ -16,6 +16,27 @@ Windows capture strategy (tried in order):
 import sys
 import time
 import threading
+import subprocess
+import base64
+
+
+# ── Windows: modifier-state helpers ──────────────────────────────────────────
+
+def _wait_for_right_alt_release(timeout_ms: int = 200) -> None:
+    """Wait briefly for the physical Right-Alt key to be released."""
+    import ctypes
+
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    VK_RMENU = 0xA5
+    deadline = time.perf_counter() + (timeout_ms / 1000.0)
+
+    while time.perf_counter() < deadline:
+        if not (user32.GetAsyncKeyState(VK_RMENU) & 0x8000):
+            print("[clipboard] Right-Alt released before SendInput")
+            break
+        time.sleep(0.01)
+    else:
+        print("[clipboard] Right-Alt still pressed at SendInput timeout")
 
 
 # ── Windows: check privilege levels ──────────────────────────────────────────
@@ -57,6 +78,31 @@ def _our_process_elevated() -> bool:
     return _is_process_elevated(os.getpid())
 
 
+def _get_process_image_name(pid: int) -> str:
+    import ctypes, ctypes.wintypes as wt
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    psapi = ctypes.WinDLL("psapi", use_last_error=True)
+
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    hproc = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if not hproc:
+        return ""
+    try:
+        buf = ctypes.create_unicode_buffer(260)
+        size = wt.DWORD(len(buf))
+        if kernel32.QueryFullProcessImageNameW(hproc, 0, buf, ctypes.byref(size)):
+            path = buf.value
+            return path.rsplit("\\", 1)[-1]
+
+        # Fallback for older/odd cases.
+        if psapi.GetModuleBaseNameW(hproc, None, buf, len(buf)):
+            return buf.value
+        return ""
+    finally:
+        kernel32.CloseHandle(hproc)
+
+
 # ── Windows: SendInput Ctrl+C ─────────────────────────────────────────────────
 
 def _sendinput_ctrl_c() -> int:
@@ -67,7 +113,10 @@ def _sendinput_ctrl_c() -> int:
 
     INPUT_KEYBOARD  = 1
     KEYEVENTF_KEYUP = 0x0002
-    VK_CONTROL, VK_C, VK_RMENU = 0x11, 0x43, 0xA5
+    VK_CONTROL, VK_C = 0x11, 0x43
+    VK_LCONTROL, VK_RCONTROL = 0xA2, 0xA3
+    VK_MENU, VK_LMENU, VK_RMENU = 0x12, 0xA4, 0xA5
+    VK_SHIFT, VK_LSHIFT, VK_RSHIFT = 0x10, 0xA0, 0xA1
 
     class _KI(ctypes.Structure):
         _fields_ = [("wVk",        wt.WORD),
@@ -93,20 +142,173 @@ def _sendinput_ctrl_c() -> int:
         i.ki.wVk = vk; i.ki.dwFlags = flags
         return i
 
-    # Prepend a synthetic Right-Alt key-up to clear the Alt modifier state.
-    # The WH_KEYBOARD_LL hook fires on keydown; even when we suppress the event
-    # (return 1), the virtual key state (GetKeyState/GetAsyncKeyState) still
-    # tracks VK_MENU as "held" until the physical key is released. Target apps
-    # check GetKeyState(VK_MENU) while processing WM_KEYDOWN for VK_C, so they
-    # see Alt+Ctrl+C instead of Ctrl+C, and ignore it. Injecting the key-up
-    # first updates the virtual state so the subsequent Ctrl+C arrives clean.
-    events = (_mk(VK_RMENU, KEYEVENTF_KEYUP),
-              _mk(VK_CONTROL), _mk(VK_C),
-              _mk(VK_C, KEYEVENTF_KEYUP), _mk(VK_CONTROL, KEYEVENTF_KEYUP))
-    arr = (INPUT * 5)(*events)
+    _wait_for_right_alt_release()
+
+    # Right Alt can behave as AltGr (Ctrl+Alt) on some layouts. Before sending
+    # Ctrl+C, force-release all common modifier virtual keys so Chromium-based
+    # apps do not interpret the sequence as AltGr+C / Alt+Ctrl+C.
+    release_modifiers = (
+        VK_RMENU, VK_MENU, VK_LMENU,
+        VK_RCONTROL, VK_LCONTROL, VK_CONTROL,
+        VK_RSHIFT, VK_LSHIFT, VK_SHIFT,
+    )
+    events = tuple(_mk(vk, KEYEVENTF_KEYUP) for vk in release_modifiers) + (
+        _mk(VK_CONTROL), _mk(VK_C),
+        _mk(VK_C, KEYEVENTF_KEYUP), _mk(VK_CONTROL, KEYEVENTF_KEYUP),
+    )
+    arr = (INPUT * len(events))(*events)
     cb = ctypes.sizeof(INPUT)
     print(f"[clipboard] INPUT cbSize={cb}  (expect 40 on 64-bit Python)")
-    return user32.SendInput(5, arr, cb)
+    return user32.SendInput(len(events), arr, cb)
+
+
+def _pynput_ctrl_c() -> bool:
+    try:
+        from pynput.keyboard import Controller, Key
+
+        ctrl = Controller()
+        ctrl.press(Key.ctrl)
+        ctrl.press("c")
+        time.sleep(0.05)
+        ctrl.release("c")
+        ctrl.release(Key.ctrl)
+        return True
+    except Exception as exc:
+        print(f"[clipboard] pynput Ctrl+C failed: {exc}")
+        return False
+
+
+def _pynput_ctrl_insert() -> bool:
+    try:
+        from pynput.keyboard import Controller, Key
+
+        ctrl = Controller()
+        ctrl.press(Key.ctrl)
+        ctrl.press(Key.insert)
+        time.sleep(0.05)
+        ctrl.release(Key.insert)
+        ctrl.release(Key.ctrl)
+        return True
+    except Exception as exc:
+        print(f"[clipboard] pynput Ctrl+Insert failed: {exc}")
+        return False
+
+
+def _sendinput_apps_copy() -> int:
+    """Open the context menu via Apps key and trigger Copy via accelerator."""
+    import ctypes, ctypes.wintypes as wt
+
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+
+    INPUT_KEYBOARD  = 1
+    KEYEVENTF_KEYUP = 0x0002
+    VK_APPS, VK_C = 0x5D, 0x43
+
+    class _KI(ctypes.Structure):
+        _fields_ = [("wVk", wt.WORD),
+                    ("wScan", wt.WORD),
+                    ("dwFlags", wt.DWORD),
+                    ("time", wt.DWORD),
+                    ("dwExtraInfo", ctypes.c_size_t)]
+
+    class _IU(ctypes.Union):
+        _fields_ = [("ki", _KI), ("_pad", ctypes.c_byte * 32)]
+
+    class INPUT(ctypes.Structure):
+        _anonymous_ = ("u",)
+        _fields_    = [("type", wt.DWORD), ("u", _IU)]
+
+    def _mk(vk, flags=0):
+        i = INPUT()
+        i.type = INPUT_KEYBOARD
+        i.ki.wVk = vk
+        i.ki.dwFlags = flags
+        return i
+
+    events = (
+        _mk(VK_APPS), _mk(VK_APPS, KEYEVENTF_KEYUP),
+        _mk(VK_C), _mk(VK_C, KEYEVENTF_KEYUP),
+    )
+    arr = (INPUT * len(events))(*events)
+    return user32.SendInput(len(events), arr, ctypes.sizeof(INPUT))
+
+
+def _clipboard_text_once():
+    try:
+        import pyperclip
+
+        return pyperclip.paste() or ""
+    except Exception as exc:
+        print(f"[clipboard] pyperclip paste failed: {exc}")
+
+    import ctypes
+
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    CF_UNICODETEXT = 13
+
+    result = ""
+    if user32.OpenClipboard(None):
+        try:
+            handle = user32.GetClipboardData(CF_UNICODETEXT)
+            if handle:
+                ptr = kernel32.GlobalLock(handle)
+                if ptr:
+                    try:
+                        result = ctypes.wstring_at(ptr)
+                    finally:
+                        kernel32.GlobalUnlock(handle)
+        finally:
+            user32.CloseClipboard()
+    return result
+
+
+def _poll_clipboard_text(attempts: int = 20, sleep_s: float = 0.06) -> str:
+    result = ""
+    for _ in range(attempts):
+        time.sleep(sleep_s)
+        result = _clipboard_text_once()
+        if result:
+            return result
+    return ""
+
+
+def _get_focused_target(hwnd_foreground):
+    import ctypes, ctypes.wintypes as wt
+
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+
+    class GUITHREADINFO(ctypes.Structure):
+        _fields_ = [("cbSize",      wt.DWORD),
+                    ("flags",       wt.DWORD),
+                    ("hwndActive",  wt.HWND),
+                    ("hwndFocus",   wt.HWND),
+                    ("hwndCapture", wt.HWND),
+                    ("hwndMenuOwner", wt.HWND),
+                    ("hwndMoveSize",  wt.HWND),
+                    ("hwndCaret",   wt.HWND),
+                    ("rcCaret",     wt.RECT)]
+
+    tid = user32.GetWindowThreadProcessId(hwnd_foreground, None)
+    gti = GUITHREADINFO()
+    gti.cbSize = ctypes.sizeof(GUITHREADINFO)
+    hwnd_target = hwnd_foreground
+    if user32.GetGUIThreadInfo(tid, ctypes.byref(gti)) and gti.hwndFocus:
+        hwnd_target = gti.hwndFocus
+
+    cls = ctypes.create_unicode_buffer(64)
+    user32.GetClassNameW(hwnd_target, cls, 64)
+    return hwnd_target, cls.value
+
+
+def _send_appcommand_copy(hwnd_target) -> bool:
+    import ctypes
+
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    WM_APPCOMMAND = 0x0319
+    APPCOMMAND_COPY = 36
+    lparam = APPCOMMAND_COPY << 16
+    return bool(user32.SendMessageW(hwnd_target, WM_APPCOMMAND, hwnd_target, lparam))
 
 
 # ── Windows: UIAutomation selected-text (works across UIPI) ──────────────────
@@ -168,7 +370,7 @@ def _uia_get_selected_text() -> str:
         )
         if hr != 0 or not ppv:
             print(f"[clipboard] UIA CoCreateInstance hr={hr:#010x}")
-            return ""
+            return _uia_get_selected_text_powershell()
 
         # vtable layout of IUIAutomation (inherits IUnknown: QI/AddRef/Release)
         # Index 3 = GetRootElement, Index 5 = GetFocusedElement
@@ -188,7 +390,7 @@ def _uia_get_selected_text() -> str:
         hr = get_focused(ppv, ctypes.byref(el))
         if hr != 0 or not el:
             print(f"[clipboard] UIA GetFocusedElement hr={hr:#010x}")
-            return ""
+            return _uia_get_selected_text_powershell()
 
         # GetCurrentPattern(element, UIA_TextPatternId=10014, ppPattern)
         UIA_TextPatternId = 10014
@@ -208,7 +410,7 @@ def _uia_get_selected_text() -> str:
         hr = get_pattern(el, UIA_TextPatternId, ctypes.byref(pat))
         if hr != 0 or not pat:
             print(f"[clipboard] UIA GetCurrentPattern hr={hr:#010x} (no TextPattern)")
-            return ""
+            return _uia_get_selected_text_powershell()
 
         # ITextPattern::GetSelection → IUIAutomationTextRangeArray*
         pat_vt   = ctypes.cast(pat, ctypes.POINTER(ctypes.c_void_p))
@@ -222,7 +424,7 @@ def _uia_get_selected_text() -> str:
         hr = get_sel(pat, ctypes.byref(ranges))
         if hr != 0 or not ranges:
             print(f"[clipboard] UIA GetSelection hr={hr:#010x}")
-            return ""
+            return _uia_get_selected_text_powershell()
 
         # IUIAutomationTextRangeArray::get_Length → int
         ra_vt   = ctypes.cast(ranges, ctypes.POINTER(ctypes.c_void_p))
@@ -235,7 +437,7 @@ def _uia_get_selected_text() -> str:
         length  = ctypes.c_int(0)
         get_len(ranges, ctypes.byref(length))
         if length.value == 0:
-            return ""
+            return _uia_get_selected_text_powershell()
 
         # GetElement(0) → IUIAutomationTextRange*
         GET_EL = 4
@@ -245,7 +447,7 @@ def _uia_get_selected_text() -> str:
         rng = ctypes.c_void_p()
         get_el(ranges, 0, ctypes.byref(rng))
         if not rng:
-            return ""
+            return _uia_get_selected_text_powershell()
 
         # IUIAutomationTextRange::GetText(-1) → BSTR
         rng_vt   = ctypes.cast(rng, ctypes.POINTER(ctypes.c_void_p))
@@ -265,10 +467,111 @@ def _uia_get_selected_text() -> str:
             print(f"[clipboard] UIA selected text: {repr(result[:60])}")
             return result
 
-        return ""
+        return _uia_get_selected_text_powershell()
 
     except Exception as exc:
         print(f"[clipboard] UIA failed: {exc}")
+        return _uia_get_selected_text_powershell()
+
+
+def _uia_get_selected_text_powershell() -> str:
+    """
+    Fallback UIAutomation probe via PowerShell/.NET.
+    Chromium often exposes the useful TextPattern on a descendant rather than
+    directly on the focused element, so this path breadth-first walks a small
+    UIA subtree and returns the first non-empty selection it finds.
+    """
+    script = r"""
+Add-Type -AssemblyName UIAutomationClient
+Add-Type -AssemblyName UIAutomationTypes
+
+$trueCond = [System.Windows.Automation.Condition]::TrueCondition
+$textPatternId = [System.Windows.Automation.TextPattern]::Pattern
+$treeScopeChildren = [System.Windows.Automation.TreeScope]::Children
+
+function Get-SelectionText([System.Windows.Automation.AutomationElement]$root) {
+    if ($null -eq $root) { return $null }
+
+    $queue = New-Object 'System.Collections.Generic.Queue[System.Windows.Automation.AutomationElement]'
+    $queue.Enqueue($root)
+    $visited = 0
+
+    while ($queue.Count -gt 0 -and $visited -lt 200) {
+        $visited += 1
+        $el = $queue.Dequeue()
+        if ($null -eq $el) { continue }
+
+        $pattern = $null
+        if ($el.TryGetCurrentPattern($textPatternId, [ref]$pattern) -and $null -ne $pattern) {
+            try {
+                $ranges = $pattern.GetSelection()
+                if ($null -ne $ranges -and $ranges.Length -gt 0) {
+                    $text = $ranges[0].GetText(-1)
+                    if (-not [string]::IsNullOrWhiteSpace($text)) {
+                        return $text
+                    }
+                }
+            } catch {}
+        }
+
+        try {
+            $children = $el.FindAll($treeScopeChildren, $trueCond)
+            for ($i = 0; $i -lt $children.Count; $i++) {
+                $child = $children.Item($i)
+                if ($null -ne $child) {
+                    $queue.Enqueue($child)
+                }
+            }
+        } catch {}
+    }
+
+    return $null
+}
+
+$focused = [System.Windows.Automation.AutomationElement]::FocusedElement
+$result = Get-SelectionText $focused
+
+if ([string]::IsNullOrWhiteSpace($result)) {
+    try {
+        $walker = [System.Windows.Automation.TreeWalker]::ControlViewWalker
+        $parent = $walker.GetParent($focused)
+        $result = Get-SelectionText $parent
+    } catch {}
+}
+
+if (-not [string]::IsNullOrWhiteSpace($result)) {
+    [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+    [Console]::Write($result)
+}
+"""
+    try:
+        encoded = base64.b64encode(script.encode("utf-16le")).decode("ascii")
+        proc = subprocess.run(
+            [
+                "powershell",
+                "-NoProfile",
+                "-NonInteractive",
+                "-STA",
+                "-EncodedCommand",
+                encoded,
+            ],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=2.5,
+        )
+        if proc.returncode != 0:
+            stderr = (proc.stderr or "").strip()
+            if stderr:
+                print(f"[clipboard] PowerShell UIA failed: {stderr[:200]}")
+            return ""
+        result = (proc.stdout or "").strip()
+        if result:
+            print(f"[clipboard] PowerShell UIA selected text: {repr(result[:60])}")
+        return result
+    except Exception as exc:
+        print(f"[clipboard] PowerShell UIA exception: {exc}")
         return ""
 
 
@@ -354,6 +657,91 @@ def _sci_get_selected_text(hwnd_sci) -> str:
         kernel32.CloseHandle(hproc)
 
 
+def _std_edit_get_selected_text(hwnd_target) -> str:
+    """
+    Read selected text from common Win32 text controls without using clipboard.
+    Covers Edit / RichEdit family controls used by many editors and chat apps.
+    """
+    import ctypes, ctypes.wintypes as wt
+
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+
+    WM_GETTEXT       = 0x000D
+    WM_GETTEXTLENGTH = 0x000E
+    EM_GETSEL        = 0x00B0
+
+    length = user32.SendMessageW(hwnd_target, WM_GETTEXTLENGTH, 0, 0)
+    if length <= 0:
+        return ""
+
+    start = wt.DWORD(0)
+    end = wt.DWORD(0)
+    user32.SendMessageW(hwnd_target, EM_GETSEL, ctypes.byref(start), ctypes.byref(end))
+    if end.value <= start.value:
+        return ""
+
+    buf = ctypes.create_unicode_buffer(length + 1)
+    copied = user32.SendMessageW(hwnd_target, WM_GETTEXT, length + 1, buf)
+    if copied <= 0:
+        return ""
+
+    text = buf.value
+    if start.value >= len(text):
+        return ""
+    return text[start.value:end.value]
+
+
+def _sendinput_ctrl_insert() -> int:
+    """Fallback copy accelerator used by some editors and chat controls."""
+    import ctypes, ctypes.wintypes as wt
+
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+
+    INPUT_KEYBOARD  = 1
+    KEYEVENTF_KEYUP = 0x0002
+    VK_CONTROL, VK_INSERT = 0x11, 0x2D
+
+    class _KI(ctypes.Structure):
+        _fields_ = [("wVk", wt.WORD),
+                    ("wScan", wt.WORD),
+                    ("dwFlags", wt.DWORD),
+                    ("time", wt.DWORD),
+                    ("dwExtraInfo", ctypes.c_size_t)]
+
+    class _IU(ctypes.Union):
+        _fields_ = [("ki", _KI), ("_pad", ctypes.c_byte * 32)]
+
+    class INPUT(ctypes.Structure):
+        _anonymous_ = ("u",)
+        _fields_    = [("type", wt.DWORD), ("u", _IU)]
+
+    def _mk(vk, flags=0):
+        i = INPUT()
+        i.type = INPUT_KEYBOARD
+        i.ki.wVk = vk
+        i.ki.dwFlags = flags
+        return i
+
+    events = (
+        _mk(VK_CONTROL), _mk(VK_INSERT),
+        _mk(VK_INSERT, KEYEVENTF_KEYUP), _mk(VK_CONTROL, KEYEVENTF_KEYUP),
+    )
+    arr = (INPUT * len(events))(*events)
+    return user32.SendInput(len(events), arr, ctypes.sizeof(INPUT))
+
+
+def _is_standard_text_control(class_name: str) -> bool:
+    cls = (class_name or "").lower()
+    return (
+        cls == "edit"
+        or cls.startswith("richedit")
+        or cls == "richeditd2dpt"
+        or cls == "richedit20w"
+        or cls == "richedit20a"
+        or cls == "richedit50w"
+    )
+
+
 # ── WM_COPY / focused-control helper ─────────────────────────────────────────
 
 def _wm_copy(hwnd_foreground) -> str:
@@ -363,38 +751,15 @@ def _wm_copy(hwnd_foreground) -> str:
     For other controls: sends WM_COPY and reads clipboard.
     No keyboard injection — immune to Alt-key state.
     """
-    import ctypes, ctypes.wintypes as wt
+    import ctypes
 
     user32   = ctypes.WinDLL("user32",   use_last_error=True)
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    hwnd_target, class_name = _get_focused_target(hwnd_foreground)
+    print(f"[clipboard] focused control: hwnd={hwnd_target}  class={repr(class_name)}")
 
-    class GUITHREADINFO(ctypes.Structure):
-        _fields_ = [("cbSize",      wt.DWORD),
-                    ("flags",       wt.DWORD),
-                    ("hwndActive",  wt.HWND),
-                    ("hwndFocus",   wt.HWND),
-                    ("hwndCapture", wt.HWND),
-                    ("hwndMenuOwner", wt.HWND),
-                    ("hwndMoveSize",  wt.HWND),
-                    ("hwndCaret",   wt.HWND),
-                    ("rcCaret",     wt.RECT)]
-
-    tid = user32.GetWindowThreadProcessId(hwnd_foreground, None)
-    gti = GUITHREADINFO()
-    gti.cbSize = ctypes.sizeof(GUITHREADINFO)
-    hwnd_target = hwnd_foreground
-    if user32.GetGUIThreadInfo(tid, ctypes.byref(gti)) and gti.hwndFocus:
-        hwnd_target = gti.hwndFocus
-
-    cls = ctypes.create_unicode_buffer(64)
-    user32.GetClassNameW(hwnd_target, cls, 64)
-    print(f"[clipboard] focused control: hwnd={hwnd_target}  class={repr(cls.value)}")
-
-    # Scintilla: read directly via SCI_GETSELTEXT (most reliable)
-    if "scintilla" in cls.value.lower():
-        result = _sci_get_selected_text(hwnd_target)
-        if result:
-            print(f"[clipboard] Scintilla direct: {repr(result[:60])}")
+    result = _direct_control_capture(hwnd_target, class_name)
+    if result:
         return result
 
     # Other controls: WM_COPY → clipboard
@@ -406,26 +771,54 @@ def _wm_copy(hwnd_foreground) -> str:
     user32.SendMessageW(hwnd_target, WM_COPY, 0, 0)
     time.sleep(0.05)
 
-    CF_UNICODETEXT = 13
-    result = ""
-    if user32.OpenClipboard(None):
-        try:
-            handle = user32.GetClipboardData(CF_UNICODETEXT)
-            if handle:
-                ptr = kernel32.GlobalLock(handle)
-                if ptr:
-                    try:
-                        result = ctypes.wstring_at(ptr)
-                    finally:
-                        kernel32.GlobalUnlock(handle)
-        finally:
-            user32.CloseClipboard()
+    result = _clipboard_text_once()
 
     if result:
         print(f"[clipboard] WM_COPY result: {repr(result[:60])}")
     else:
         print("[clipboard] WM_COPY: clipboard empty after send")
     return result
+
+
+def _direct_control_capture(hwnd_target, class_name: str) -> str:
+    # Scintilla: read directly via SCI_GETSELTEXT (most reliable)
+    if "scintilla" in class_name.lower():
+        result = _sci_get_selected_text(hwnd_target)
+        if result:
+            print(f"[clipboard] Scintilla direct: {repr(result[:60])}")
+        return result
+
+    # Standard Edit / RichEdit family: read text and selection directly.
+    if _is_standard_text_control(class_name):
+        result = _std_edit_get_selected_text(hwnd_target)
+        if result:
+            print(f"[clipboard] Text-control direct: {repr(result[:60])}")
+        return result
+
+    return ""
+
+
+def _is_chromium_window_class(class_name: str) -> bool:
+    cls = (class_name or "").lower()
+    return cls.startswith("chrome_widgetwin") or "renderwidgethost" in cls
+
+
+def _is_chat_or_office_process(process_name: str) -> bool:
+    name = (process_name or "").lower()
+    return name in {
+        "weixin.exe",
+        "wechat.exe",
+        "qq.exe",
+        "qqnt.exe",
+        "tim.exe",
+        "wxwork.exe",
+        "dingtalk.exe",
+        "winword.exe",
+        "wps.exe",
+        "wpp.exe",
+        "et.exe",
+        "wpspdf.exe",
+    }
 
 
 # ── Windows main capture ──────────────────────────────────────────────────────
@@ -440,25 +833,34 @@ def _capture_win32() -> str:
     buf  = ctypes.create_unicode_buffer(256)
     user32.GetWindowTextW(hwnd, buf, 256)
     print(f"[clipboard] foreground: hwnd={hwnd}  title={repr(buf.value[:60])}")
+    cls_buf = ctypes.create_unicode_buffer(64)
+    user32.GetClassNameW(hwnd, cls_buf, 64)
+    foreground_class = cls_buf.value
 
     # Detect UIPI: get the PID of the foreground window
     pid = wt.DWORD(0)
     user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+    process_name = _get_process_image_name(pid.value)
     target_elevated = False
     try:
         target_elevated = _is_process_elevated(pid.value)
     except Exception:
         pass
     we_elevated = _our_process_elevated()
+    if process_name:
+        print(f"[clipboard] process: {process_name}")
     print(f"[clipboard] privilege: ours={'admin' if we_elevated else 'user'}  "
           f"target={'admin' if target_elevated else 'user'}")
 
-    # ── Strategy 1: WM_COPY (no keyboard injection, works for most controls) ──
-    result = _wm_copy(hwnd)
+    hwnd_target, focused_class = _get_focused_target(hwnd)
+    print(f"[clipboard] focused control: hwnd={hwnd_target}  class={repr(focused_class)}")
+
+    # ── Strategy 1: direct control reads for known controls ──────────────────
+    result = _direct_control_capture(hwnd_target, focused_class)
     if result:
         return result
 
-    # ── Strategy 2: SendInput Ctrl+C (same or higher privilege required) ──────
+    # ── Strategy 2: simulated Ctrl+C (same or higher privilege required) ──────
     if not target_elevated or we_elevated:
         # Verify the target window still has foreground focus before injecting.
         # The recording overlay (shown via record_started signal on Qt main
@@ -472,42 +874,80 @@ def _capture_win32() -> str:
                   f"skipping SendInput")
             return ""
 
-        # Clear clipboard
-        user32.OpenClipboard(None)
-        user32.EmptyClipboard()
-        user32.CloseClipboard()
+        try:
+            import pyperclip
+            pyperclip.copy("")
+        except Exception:
+            user32.OpenClipboard(None)
+            user32.EmptyClipboard()
+            user32.CloseClipboard()
         time.sleep(0.05)
 
-        sent = _sendinput_ctrl_c()
-        print(f"[clipboard] SendInput sent={sent}/5")
+        sent = _pynput_ctrl_c()
+        print(f"[clipboard] pynput Ctrl+C sent={sent}")
+        result = _poll_clipboard_text()
+        if result:
+            print(f"[clipboard] pynput Ctrl+C result: {repr(result[:60])}")
+            return result
+        print("[clipboard] pynput Ctrl+C: clipboard empty")
 
-        # Poll the clipboard instead of a single fixed sleep.
-        # Chromium-based apps (Chrome, VSCode, Electron) write to the clipboard
-        # asynchronously after the Renderer process handles the key event via
-        # IPC — a single 300 ms sleep can race with that write.
-        CF_UNICODETEXT = 13
-        result = ""
-        for _ in range(10):           # up to ~600 ms total (10 × 60 ms)
-            time.sleep(0.06)
-            if user32.OpenClipboard(None):
-                try:
-                    handle = user32.GetClipboardData(CF_UNICODETEXT)
-                    if handle:
-                        ptr = ctypes.windll.kernel32.GlobalLock(handle)
-                        if ptr:
-                            try:
-                                result = ctypes.wstring_at(ptr)
-                            finally:
-                                ctypes.windll.kernel32.GlobalUnlock(handle)
-                finally:
-                    user32.CloseClipboard()
+        # For custom-rendered windows (Qt/Chromium/Electron), match the
+        # standalone test as closely as possible before trying WM_COPY-style
+        # fallbacks. Sending WM_COPY to the top-level host window can be a no-op
+        # or disturb the internal selection routing.
+        if not _is_standard_text_control(focused_class) and "scintilla" not in focused_class.lower():
+            print("[clipboard] custom-rendered control; skipping early WM_COPY path")
+        else:
+            result = _wm_copy(hwnd)
             if result:
-                break
+                return result
 
+        sent = _sendinput_ctrl_c()
+        print(f"[clipboard] SendInput sent={sent} events")
+        result = _poll_clipboard_text()
         if result:
             print(f"[clipboard] SendInput result: {repr(result[:60])}")
             return result
-        print("[clipboard] SendInput: clipboard empty, trying UIAutomation…")
+        print("[clipboard] SendInput: clipboard empty")
+
+        if _is_chat_or_office_process(process_name):
+            print("[clipboard] Chat/Office process detected; trying Ctrl+Insert…")
+            sent = _pynput_ctrl_insert()
+            print(f"[clipboard] pynput Ctrl+Insert sent={sent}")
+            result = _poll_clipboard_text(attempts=20, sleep_s=0.06)
+            if result:
+                print(f"[clipboard] pynput Ctrl+Insert result: {repr(result[:60])}")
+                return result
+            print("[clipboard] pynput Ctrl+Insert: clipboard empty")
+
+            sent = _sendinput_ctrl_insert()
+            print(f"[clipboard] Ctrl+Insert copy sent={sent} events")
+            result = _poll_clipboard_text(attempts=20, sleep_s=0.06)
+            if result:
+                print(f"[clipboard] Ctrl+Insert result: {repr(result[:60])}")
+                return result
+            print("[clipboard] Ctrl+Insert: clipboard empty")
+
+            print("[clipboard] trying WM_APPCOMMAND copy…")
+            ok = _send_appcommand_copy(hwnd_target)
+            print(f"[clipboard] WM_APPCOMMAND copy returned={ok}")
+            result = _poll_clipboard_text(attempts=20, sleep_s=0.06)
+            if result:
+                print(f"[clipboard] WM_APPCOMMAND result: {repr(result[:60])}")
+                return result
+            print("[clipboard] WM_APPCOMMAND: clipboard empty")
+
+        if _is_chromium_window_class(foreground_class):
+            print("[clipboard] Chromium window detected; trying context-menu copy…")
+            sent = _sendinput_apps_copy()
+            print(f"[clipboard] Apps-key copy sent={sent} events")
+            result = _poll_clipboard_text(attempts=25, sleep_s=0.08)
+            if result:
+                print(f"[clipboard] Apps-key copy result: {repr(result[:60])}")
+                return result
+            print("[clipboard] Apps-key copy: clipboard empty, trying UIAutomation…")
+        else:
+            print("[clipboard] trying UIAutomation…")
 
     # ── Strategy 3: UIAutomation (crosses UIPI — works with elevated targets) ─
     print("[clipboard] trying UIAutomation (UIPI bypass)…")
@@ -519,6 +959,11 @@ def _capture_win32() -> str:
     if target_elevated and not we_elevated:
         print("[clipboard] UIPI: target is elevated, we are not.\n"
               "  → 请以管理员身份运行简单助手，或关闭目标程序的管理员权限。")
+    elif _is_chromium_window_class(foreground_class):
+        print("[clipboard] Chromium page text is not accessible through this path.")
+        print("[clipboard] Chrome/Edge often keep web-content accessibility off")
+        print("[clipboard] unless a screen reader is detected or renderer")
+        print("[clipboard] accessibility is forced on.")
     else:
         print("[clipboard] could not capture selected text")
     return ""
